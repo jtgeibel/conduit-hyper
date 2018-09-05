@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::io::Cursor;
+use std::sync::Mutex;
 
 use conduit::{Handler, Request, Response};
 use futures::{Future, Stream};
@@ -25,10 +26,17 @@ impl Handler for ErrorResult {
     }
 }
 
-struct Panic;
-impl Handler for Panic {
-    fn call(&self, _req: &mut Request) -> Result<Response, Box<Error + Send>> {
-        panic!()
+struct PanicOnce(Mutex<()>);
+impl Handler for PanicOnce {
+    fn call(&self, req: &mut Request) -> Result<Response, Box<Error + Send>> {
+        // A previous panic may have caused inconsistent state.
+        // Return a normal result as a flag to the test code.
+        if self.0.is_poisoned() {
+            return OkResult.call(req);
+        };
+
+        let _dont_drop = self.0.lock();
+        panic!();
     }
 }
 
@@ -101,8 +109,19 @@ fn err_responses() {
     assert_generic_err(simulate_request(ErrorResult));
 }
 
-#[ignore] // catch_unwind not yet implemented
 #[test]
 fn recover_from_panic() {
-    assert_generic_err(simulate_request(Panic));
+    use hyper::service::{NewService, Service};
+
+    let handler = PanicOnce(Mutex::default());
+    let new_service = super::Service::new(handler, 1);
+    let mut service = new_service.new_service().wait().unwrap();
+
+    // First call panics and is turned into a generic error
+    let response = service.call(hyper::Request::default()).wait().unwrap();
+    assert_generic_err(response);
+
+    // Second call returns status 200 to indicate a poisoned mutex
+    let response = service.call(hyper::Request::default()).wait().unwrap();
+    assert_eq!(response.status(), 200);
 }

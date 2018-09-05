@@ -14,6 +14,7 @@ mod tests;
 
 use std::io::{Cursor, Read};
 use std::net::SocketAddr;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use futures::{future, Future, Stream};
@@ -209,17 +210,24 @@ impl<H: conduit::Handler> hyper::service::Service for Service<H> {
     /// Returns a future which buffers the response body and then calls the conduit handler from a thread pool
     fn call(&mut self, request: Request<Self::ReqBody>) -> Self::Future {
         let pool = self.pool.clone();
-        let handler = self.handler.clone();
+        // Handlers that have interior mutability between requests are unlikely.  Any hanlders that
+        // do must be prepared to handle poisoned mutexes.
+        let handler = AssertUnwindSafe(self.handler.clone());
 
         let (parts, body) = request.into_parts();
+
         let response = body.concat2().and_then(move |full_body| {
             pool.spawn_fn(move || {
-                let mut request = ConduitRequest::new(Parts(parts), full_body);
-                let response = handler
-                    .call(&mut request)
-                    .map(good_response)
-                    .unwrap_or_else(|e| error_response(e.description()));
-
+                // If the handler panics, the request is dropped and potentially inconsistent data
+                // is not observable.
+                let mut request = AssertUnwindSafe(ConduitRequest::new(Parts(parts), full_body));
+                let response =
+                    catch_unwind(move || {
+                        handler
+                            .call(&mut *request)
+                            .map(good_response)
+                            .unwrap_or_else(|e| error_response(e.description()))
+                    }).unwrap_or_else(|_| error_response("Application handler paniced"));
                 Ok(response)
             })
         });

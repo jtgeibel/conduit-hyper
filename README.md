@@ -10,9 +10,14 @@ stack.
 If the application handler returns an `Err(_)` the server will log the
 description via the `log` crate and then return a generic 500 status response.
 
-If the handler panics, the default panic handler prints a message to stderr and the
-connnection is closed without sending a response.  In the future, these panics
-will likely be turned into a generic 500 status response.
+If the handler panics, the default panic handler prints a message to stderr,
+the handler is unwound, an error is logged via `log`, and a generic 500 status
+response is returned.
+
+Handlers that rely on interior mutability (such as with a `Mutex`) must be
+prepared to deal with possibly inconsistent state (such as a poisoned `Mutex`)
+if a previous call has paniced.  It is unlikely that many handlers have such
+shared state between requests.
 
 ## Request Processing
 
